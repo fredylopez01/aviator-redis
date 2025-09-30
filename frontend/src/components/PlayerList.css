@@ -1,0 +1,67 @@
+.player-list {
+  height: 100%;
+  width: 30%;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 20px;
+  border-radius: 10px;
+}
+
+.players-container {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.player-card {
+  background: rgba(255, 255, 255, 0.1);
+  margin: 10px 0;
+  padding: 15px;
+  border-radius: 8px;
+  border-left: 4px solid #00ff88;
+}
+
+.player-name {
+  font-weight: bold;
+  font-size: 1.1rem;
+}
+
+.player-balance {
+  margin: 5px 0;
+  opacity: 0.9;
+}
+
+.player-bet {
+  margin: 5px 0;
+  font-size: 0.9rem;
+}
+
+.player-win {
+  color: #00ff88;
+  font-weight: bold;
+}
+
+.player-status {
+  color: #ffaa00;
+  font-style: italic;
+  font-size: 0.9rem;
+}
+
+.no-players {
+  text-align: center;
+  opacity: 0.7;
+  font-style: italic;
+}
+
+@media (max-width: 768px) {
+  .game {
+    grid-template-areas:
+      "info"
+      "multiplier"
+      "controls"
+      "players";
+    grid-template-columns: 1fr;
+  }
+
+  .multiplier-display h2 {
+    font-size: 3rem;
+  }
+}

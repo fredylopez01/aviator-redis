@@ -1,0 +1,77 @@
+.controls {
+  grid-area: controls;
+  background: rgba(255, 255, 255, 0.1);
+  padding: 20px;
+  border-radius: 10px;
+  height: fit-content;
+}
+
+.bet-section {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 15px;
+  align-items: center;
+}
+
+.controls input {
+  padding: 10px;
+  border: none;
+  border-radius: 5px;
+  font-size: 1rem;
+  width: 100px;
+}
+
+.btn-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 15px;
+}
+
+.cashout-button {
+  width: 50%;
+  padding: 15px;
+  background: #ff4444;
+  border: none;
+  border-radius: 5px;
+  color: white;
+  font-weight: bold;
+  font-size: 1.1rem;
+  cursor: pointer;
+}
+
+.cashout-button:disabled {
+  background: #666;
+  cursor: not-allowed;
+}
+
+.bet-button {
+  width: 50%;
+  padding: 15px;
+  background: #00ff88;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  font-weight: bold;
+  font-size: 1rem;
+}
+
+.bet-button:disabled {
+  background: #666;
+  cursor: not-allowed;
+}
+
+.quick-bets {
+  display: flex;
+  gap: 5px;
+}
+
+.quick-bets button {
+  flex: 1;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.2);
+  border: none;
+  border-radius: 3px;
+  color: white;
+  cursor: pointer;
+}
