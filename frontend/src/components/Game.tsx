@@ -16,9 +16,8 @@ interface GameProps {
   player: { name: string };
 }
 
-// Configuración del juego (debe coincidir con backend)
-const TICK_INTERVAL = 50; // ms
-const TICK_INCREMENT = 0.01; // incremento por tick
+const TICK_INTERVAL = 100; // 100ms
+const TICK_INCREMENT = 0.01; // 0.01 por tick
 
 function Game({ player }: GameProps) {
   const [multiplier, setMultiplier] = useState<number>(1.0);
@@ -29,12 +28,11 @@ function Game({ player }: GameProps) {
   const [message, setMessage] = useState<string>("");
   const [gameInitialized, setGameInitialized] = useState<boolean>(false);
 
-  // Referencias para el cálculo del multiplicador
+  // Referencias
   const roundStartTime = useRef<number | null>(null);
   const multiplierInterval = useRef<number | null>(null);
-  const crashPoint = useRef<number>(2.0);
 
-  // Limpiar intervalo del multiplicador
+  // Limpiar intervalo
   const clearMultiplierInterval = () => {
     if (multiplierInterval.current) {
       clearInterval(multiplierInterval.current);
@@ -42,7 +40,7 @@ function Game({ player }: GameProps) {
     }
   };
 
-  // Calcular multiplicador basado en tiempo
+  // Calcular multiplicador basado en timestamp del servidor
   const calculateMultiplier = (startTime: number): number => {
     const elapsed = Date.now() - startTime;
     if (elapsed < 0) return 1.0;
@@ -53,21 +51,21 @@ function Game({ player }: GameProps) {
     return parseFloat(calculatedMultiplier.toFixed(2));
   };
 
-  // Iniciar actualización del multiplicador
-  const startMultiplierUpdate = (startTime: number) => {
+  // Iniciar animación del multiplicador
+  const startMultiplierAnimation = (startTime: number) => {
     clearMultiplierInterval();
     roundStartTime.current = startTime;
 
-    // Esperar hasta que llegue el momento de inicio
+    // Calcular cuánto tiempo falta para que inicie
     const delay = startTime - Date.now();
 
     if (delay > 0) {
-      // Si aún no es tiempo, esperar
+      // Esperar hasta el inicio exacto
       setTimeout(() => {
         startMultiplierLoop();
       }, delay);
     } else {
-      // Ya pasó el tiempo, iniciar inmediatamente
+      // Ya inició, empezar inmediatamente
       startMultiplierLoop();
     }
   };
@@ -75,7 +73,7 @@ function Game({ player }: GameProps) {
   const startMultiplierLoop = () => {
     if (!roundStartTime.current) return;
 
-    // Actualizar multiplicador cada TICK_INTERVAL
+    // Actualizar cada 50ms para animación suave
     multiplierInterval.current = setInterval(() => {
       if (!roundStartTime.current) {
         clearMultiplierInterval();
@@ -84,12 +82,7 @@ function Game({ player }: GameProps) {
 
       const newMultiplier = calculateMultiplier(roundStartTime.current);
       setMultiplier(newMultiplier);
-
-      // Verificar si llegamos al crashPoint (por seguridad, aunque el backend controla esto)
-      if (newMultiplier >= crashPoint.current) {
-        clearMultiplierInterval();
-      }
-    }, TICK_INTERVAL);
+    }, 50);
   };
 
   useEffect(() => {
@@ -97,21 +90,16 @@ function Game({ player }: GameProps) {
     if (!socket) return;
 
     socketManager.setPlayerName(player.name);
-    console.log("Enviando evento join para:", player.name);
+    console.log("🔌 Enviando join para:", player.name);
     socket.emit("join", player.name);
 
-    // ===== UNIRSE AL JUEGO =====
-    socket.on("join:error", (error: string) => {
-      console.error("Error al unirse:", error);
-      setMessage(`Error: ${error}`);
-    });
-
+    // ===== JOINED: Confirmación de unión =====
     socket.on("joined", (data) => {
       console.log("✅ Unido exitosamente:", data);
       setGameInitialized(true);
 
-      const playerData = {
-        id: data.player?.id || socket.id,
+      const playerData: Player = {
+        id: data.player?.id || socket.id!,
         name: data.player?.name || player.name,
         balance: data.player?.balance || 0,
         bet: data.player?.bet || 0,
@@ -121,64 +109,85 @@ function Game({ player }: GameProps) {
 
       setCurrentPlayer(playerData);
 
+      // Sincronizar con el estado actual del juego
       if (data.gameState?.round) {
-        setRoundState(data.gameState.round.state || "waiting");
-        setRoundNumber(data.gameState.round.roundNumber || 0);
+        const round = data.gameState.round;
+        setRoundState(round.state || "waiting");
+        setRoundNumber(round.roundNumber || 0);
 
         // Si la ronda está corriendo, sincronizar multiplicador
-        if (
-          data.gameState.round.state === "running" &&
-          data.gameState.round.startTime
-        ) {
-          crashPoint.current = data.gameState.round.crashPoint || 2.0;
-          startMultiplierUpdate(data.gameState.round.startTime);
+        if (round.state === "running" && round.startTime) {
+          startMultiplierAnimation(round.startTime);
         } else {
           setMultiplier(1.0);
         }
       }
 
+      if (data.gameState?.players) {
+        setPlayers(data.gameState.players);
+      }
+
       setMessage("¡Conectado al juego!");
     });
 
-    // ===== NUEVA RONDA (Período de espera) =====
-    socket.on("round:new", (data) => {
-      console.log("🆕 Nueva ronda:", data);
-      clearMultiplierInterval();
-      roundStartTime.current = null;
-
-      setRoundNumber(data.roundNumber);
-      setRoundState("waiting");
-      setMultiplier(1.0);
-      setMessage(
-        `Ronda #${data.roundNumber} - Apostar ahora (${data.waitTime / 1000}s)`
-      );
+    socket.on("join:error", (error: string) => {
+      console.error("❌ Error al unirse:", error);
+      setMessage(`Error: ${error}`);
     });
 
-    // ===== INICIO DE RONDA (Con timestamp) =====
-    socket.on("round:start", (data) => {
-      console.log("🚀 Ronda iniciada:", data);
+    // ===== ROUND:NEW: Nueva ronda (periodo de apuestas) =====
+    socket.on(
+      "round:new",
+      (data: { roundNumber: number; waitTimeMs: number }) => {
+        console.log("🆕 Nueva ronda:", data);
+        clearMultiplierInterval();
+        roundStartTime.current = null;
 
-      setRoundNumber(data.roundNumber);
-      setRoundState("running");
-      crashPoint.current = data.crashPoint;
+        setRoundNumber(data.roundNumber);
+        setRoundState("waiting");
+        setMultiplier(1.0);
+        setMessage(
+          `Ronda #${data.roundNumber} - ¡Haz tu apuesta! (${(
+            data.waitTimeMs / 1000
+          ).toFixed(0)}s)`
+        );
+      }
+    );
 
-      // Iniciar cálculo local del multiplicador
-      startMultiplierUpdate(data.startTime);
+    // ===== ROUND:START: Inicio de ronda (despegue) =====
+    socket.on(
+      "round:start",
+      (data: { roundNumber: number; startTime: number }) => {
+        console.log("🚀 Ronda iniciada:", data);
 
-      setMessage("¡Ronda en progreso!");
-    });
+        setRoundNumber(data.roundNumber);
+        setRoundState("running");
 
-    // ===== CRASH DE RONDA =====
-    socket.on("round:crash", (data) => {
-      console.log("💥 Crash:", data);
-      clearMultiplierInterval();
+        // Iniciar animación sincronizada con el servidor
+        startMultiplierAnimation(data.startTime);
 
-      setRoundState("crashed");
-      setMultiplier(data.crashPoint);
-      setMessage(`💥 Crash en ${data.crashPoint}x!`);
-    });
+        setMessage("¡Ronda en progreso! 🚀");
+      }
+    );
 
-    // ===== ACTUALIZACIÓN DE JUGADORES =====
+    // ===== ROUND:CRASH: Crash de ronda =====
+    socket.on(
+      "round:crash",
+      (data: {
+        roundNumber: number;
+        crashPoint: number;
+        crashTime: number;
+      }) => {
+        console.log("💥 Crash:", data);
+        clearMultiplierInterval();
+
+        setRoundState("crashed");
+        setMultiplier(data.crashPoint);
+        setMessage(`💥 ¡Crash en ${data.crashPoint.toFixed(2)}x!`);
+      }
+    );
+
+    // ===== PLAYERS:UPDATE: Actualización de jugadores =====
     socket.on("players:update", (playerList: Player[]) => {
       const safePlayers = playerList.map((p) => ({
         id: p.id || "",
@@ -191,73 +200,87 @@ function Game({ player }: GameProps) {
 
       setPlayers(safePlayers);
 
+      // Actualizar jugador actual
       const me = safePlayers.find((p) => p.id === socket.id);
       if (me) {
         setCurrentPlayer(me);
       }
     });
 
-    // ===== APUESTA DE JUGADOR =====
-    socket.on("player:bet", (data) => {
-      console.log("Apuesta realizada:", data);
+    // ===== PLAYER:BET: Apuesta de cualquier jugador =====
+    socket.on(
+      "player:bet",
+      (data: {
+        socketId: string;
+        playerName: string;
+        amount: number;
+        balance: number;
+      }) => {
+        console.log("🎯 Apuesta realizada:", data);
 
-      if (data.socketId === socket.id) {
-        setMessage(`Apuesta de ${data.amount} realizada!`);
+        if (data.socketId === socket.id) {
+          setMessage(`Apuesta de ${data.amount} realizada!`);
+        }
       }
-    });
+    );
 
-    // ===== RESULTADO DE APUESTA =====
-    socket.on("bet:result", (data) => {
-      console.log("Resultado de apuesta:", data);
+    // ===== BET:RESULT: Resultado de mi apuesta =====
+    socket.on(
+      "bet:result",
+      (data: { success: boolean; balance?: number; error?: string }) => {
+        console.log("📊 Resultado de apuesta:", data);
 
-      if (data.success && data.player) {
-        const safePlayer = {
-          id: data.player.id || socket.id,
-          name: data.player.name || player.name,
-          balance: data.player.balance || 0,
-          bet: data.player.bet || 0,
-          cashedOut: data.player.cashedOut || false,
-          win: data.player.win || 0,
-        };
-
-        setCurrentPlayer(safePlayer);
-      } else {
-        setMessage(data.error || "No se pudo realizar la apuesta");
+        if (!data.success) {
+          setMessage(data.error || "No se pudo realizar la apuesta");
+        }
       }
-    });
+    );
 
-    // ===== CASHOUT DE JUGADOR =====
-    socket.on("player:cashout", (data) => {
-      console.log("Cashout ejecutado:", data);
+    // ===== PLAYER:CASHOUT: Cashout de cualquier jugador =====
+    socket.on(
+      "player:cashout",
+      (data: {
+        socketId: string;
+        playerName: string;
+        winAmount: number;
+        multiplier: number;
+      }) => {
+        console.log("💰 Cashout:", data);
 
-      if (data.socketId === socket.id) {
+        if (data.socketId === socket.id) {
+          setMessage(
+            `¡Retiro exitoso! Ganaste ${data.winAmount.toFixed(
+              2
+            )} (${data.multiplier.toFixed(2)}x)`
+          );
+        }
+      }
+    );
+
+    // ===== CASHOUT:SUCCESS: Mi cashout exitoso =====
+    socket.on(
+      "cashout:success",
+      (data: { winAmount: number; multiplier: number }) => {
+        console.log("✅ Cashout exitoso:", data);
         setMessage(
-          `Retiro exitoso! Ganaste ${data.winAmount.toFixed(
+          `¡Retiro exitoso! Ganaste ${data.winAmount.toFixed(
             2
-          )} con ${data.multiplier.toFixed(2)}x`
+          )} (${data.multiplier.toFixed(2)}x)`
         );
       }
-    });
+    );
 
-    // ===== CASHOUT EXITOSO =====
-    socket.on("cashout:success", (data) => {
-      setMessage(
-        `Retiro exitoso! Ganaste ${data.winAmount.toFixed(
-          2
-        )} con ${data.multiplier.toFixed(2)}x`
-      );
-    });
-
-    // ===== CASHOUT FALLIDO =====
-    socket.on("cashout:failed", (reason) => {
-      setMessage(`Error al retirar: ${reason}`);
+    // ===== CASHOUT:FAILED: Mi cashout falló =====
+    socket.on("cashout:failed", (reason: string) => {
+      console.log("❌ Cashout fallido:", reason);
+      setMessage(`Error: ${reason}`);
     });
 
     // Cleanup
     return () => {
       clearMultiplierInterval();
-      socket.off("join:error");
       socket.off("joined");
+      socket.off("join:error");
       socket.off("round:new");
       socket.off("round:start");
       socket.off("round:crash");
@@ -268,7 +291,7 @@ function Game({ player }: GameProps) {
       socket.off("cashout:success");
       socket.off("cashout:failed");
     };
-  }, []);
+  }, [player.name]);
 
   // Limpiar mensaje después de 3 segundos
   useEffect(() => {
@@ -285,51 +308,60 @@ function Game({ player }: GameProps) {
     };
   }, []);
 
+  // ===== HANDLERS =====
+
   const handleBet = (amount: number) => {
     const socket = socketManager.getSocket();
     if (!socket) return;
 
-    if (
-      roundState === "waiting" &&
-      currentPlayer &&
-      amount <= currentPlayer.balance &&
-      currentPlayer.bet === 0
-    ) {
-      console.log("Enviando apuesta:", amount);
-      socket.emit("bet", amount);
-    } else {
-      if (currentPlayer && currentPlayer?.bet > 0) {
-        setMessage("Ya tienes una apuesta activa");
-      } else if (amount > (currentPlayer?.balance || 0)) {
-        setMessage("Saldo insuficiente");
-      } else {
-        setMessage("No puedes apostar ahora");
-      }
+    if (roundState !== "waiting") {
+      setMessage("Solo puedes apostar durante el periodo de espera");
+      return;
     }
+
+    if (!currentPlayer) {
+      setMessage("Error: Jugador no inicializado");
+      return;
+    }
+
+    if (currentPlayer.bet > 0) {
+      setMessage("Ya tienes una apuesta activa");
+      return;
+    }
+
+    if (amount > currentPlayer.balance) {
+      setMessage("Saldo insuficiente");
+      return;
+    }
+
+    console.log("📤 Enviando apuesta:", amount);
+    socket.emit("bet", amount);
   };
 
   const handleCashout = () => {
     const socket = socketManager.getSocket();
     if (!socket) return;
 
-    if (
-      roundState === "running" &&
-      currentPlayer &&
-      currentPlayer.bet > 0 &&
-      !currentPlayer.cashedOut
-    ) {
-      console.log("Intentando retirarse en", multiplier.toFixed(2) + "x");
-      socket.emit("cashout");
-    } else {
-      if (!currentPlayer?.bet || currentPlayer.bet === 0) {
-        setMessage("No tienes apuesta activa");
-      } else if (currentPlayer?.cashedOut) {
-        setMessage("Ya te retiraste en esta ronda");
-      } else {
-        setMessage("No puedes retirarte ahora");
-      }
+    if (roundState !== "running") {
+      setMessage("Solo puedes retirarte durante la ronda");
+      return;
     }
+
+    if (!currentPlayer || currentPlayer.bet <= 0) {
+      setMessage("No tienes apuesta activa");
+      return;
+    }
+
+    if (currentPlayer.cashedOut) {
+      setMessage("Ya te retiraste en esta ronda");
+      return;
+    }
+
+    console.log("📤 Enviando cashout en", multiplier.toFixed(2) + "x");
+    socket.emit("cashout");
   };
+
+  // ===== UTILIDADES =====
 
   const getMultiplierColor = () => {
     if (roundState === "crashed") return "#ff4444";
@@ -337,7 +369,8 @@ function Game({ player }: GameProps) {
     return "#ffffff";
   };
 
-  // Mostrar pantalla de inicialización
+  // ===== RENDER =====
+
   if (!gameInitialized) {
     return (
       <div className="game">
@@ -350,7 +383,6 @@ function Game({ player }: GameProps) {
     );
   }
 
-  // Mostrar error si no se puede cargar el jugador
   if (!currentPlayer) {
     return (
       <div className="game">
@@ -392,7 +424,11 @@ function Game({ player }: GameProps) {
             style={{ color: getMultiplierColor() }}
           >
             <h2>{multiplier.toFixed(2)}x</h2>
-            <p className="round-state">Estado: {roundState}</p>
+            <p className="round-state">
+              {roundState === "waiting" && "⏳ Esperando..."}
+              {roundState === "running" && "🚀 ¡Volando!"}
+              {roundState === "crashed" && "💥 Crashed"}
+            </p>
             {message && <p className="message">{message}</p>}
           </div>
           <Controls

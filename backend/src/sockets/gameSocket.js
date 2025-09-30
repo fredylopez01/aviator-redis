@@ -1,109 +1,101 @@
 const GameManager = require("../game/gameManager");
 const logger = require("../utils/logger");
 
-let gameManager;
+// UNA SOLA INSTANCIA DE GAMEMANAGER POR BACKEND
+let gameManager = null;
 
 module.exports = (io, socket) => {
   const instanceName = process.env.INSTANCE_NAME || "backend";
-  logger.info(`[${instanceName}] Cliente conectado: ${socket.id}`);
 
-  // Cuando un jugador se une
+  logger.info(`[${instanceName}] 🔌 Cliente conectado: ${socket.id}`);
+
+  // Inicializar GameManager solo una vez por backend
+  if (!gameManager) {
+    gameManager = new GameManager(io);
+    logger.info(`[${instanceName}] 🎮 GameManager inicializado`);
+  }
+
+  // ===== JOIN: Cuando un jugador se une =====
   socket.on("join", async (name) => {
     try {
-      logger.info(
-        `[${instanceName}] Jugador ${name} se unió con ID: ${socket.id}`
-      );
+      logger.info(`[${instanceName}] 👤 ${name} se unió (${socket.id})`);
 
-      // Inicializar gameManager solo cuando el primer jugador se une
-      if (!gameManager) {
-        gameManager = new GameManager(io);
-        logger.info(
-          `[${instanceName}] GameManager inicializado - Intentando ser líder`
-        );
-
-        // Esperar un poco para que Redis se configure
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-
-        // Solo el líder iniciará la primera ronda
-        if (gameManager.isLeader) {
-          logger.info(`[${instanceName}] Soy líder - Iniciando primera ronda`);
-          await gameManager.startRound();
-        }
-      }
-
-      // Agregar jugador al gameManager (SOLO UNA VEZ)
+      // Agregar jugador
       const user = await gameManager.addPlayer(socket.id, name);
 
-      // Enviar información inicial al jugador
-      const gameState = await gameManager.getGameState();
+      // Obtener estado actual del juego
+      const gameState = await gameManager.getGameState(socket.id);
+
+      // Enviar confirmación al cliente
       socket.emit("joined", {
-        player: gameManager.players[socket.id],
-        gameState: gameState,
+        player: {
+          id: socket.id,
+          name: user.name,
+          balance: user.balance,
+          bet: 0,
+          cashedOut: false,
+          win: 0,
+        },
+        gameState,
       });
+
+      logger.info(`[${instanceName}] ✅ ${name} unido exitosamente`);
     } catch (error) {
-      logger.error(`[${instanceName}] Error en join:`, error);
+      logger.error(`[${instanceName}] ❌ Error en join:`, error);
       socket.emit("join:error", "Error al unirse al juego");
     }
   });
 
-  // Cuando un jugador hace una apuesta
+  // ===== BET: Cuando un jugador apuesta =====
   socket.on("bet", async (amount) => {
-    if (!gameManager) {
+    try {
+      logger.info(`[${instanceName}] 🎯 Apuesta de ${socket.id}: $${amount}`);
+
+      const result = await gameManager.placeBet(socket.id, amount);
+
+      socket.emit("bet:result", result);
+
+      if (result.success) {
+        await gameManager.publishPlayersUpdate();
+      }
+    } catch (error) {
+      logger.error(`[${instanceName}] ❌ Error en bet:`, error);
       socket.emit("bet:result", {
         success: false,
-        error: "Juego no inicializado",
+        error: "Error al realizar apuesta",
       });
-      return;
     }
-
-    logger.info(
-      `[${instanceName}] Jugador ${socket.id} intenta apostar: ${amount}`
-    );
-    const success = await gameManager.placeBet(socket.id, amount);
-
-    socket.emit("bet:result", {
-      success,
-      player: gameManager.players[socket.id] || null,
-      error: success ? null : "No se pudo realizar la apuesta",
-    });
   });
 
-  // Cuando un jugador se retira
+  // ===== CASHOUT: Cuando un jugador se retira =====
   socket.on("cashout", async () => {
-    if (!gameManager) {
-      socket.emit("cashout:failed", "Juego no inicializado");
-      return;
-    }
+    try {
+      logger.info(`[${instanceName}] 💰 Cashout de ${socket.id}`);
 
-    logger.info(`[${instanceName}] Jugador ${socket.id} intenta retirarse`);
-    const result = await gameManager.cashout(socket.id);
+      const result = await gameManager.cashout(socket.id);
 
-    if (!result.success) {
-      socket.emit("cashout:failed", result.error || "No se pudo retirar");
+      if (!result.success) {
+        socket.emit("cashout:failed", result.error);
+      } else {
+        await gameManager.publishPlayersUpdate();
+      }
+    } catch (error) {
+      logger.error(`[${instanceName}] ❌ Error en cashout:`, error);
+      socket.emit("cashout:failed", "Error al retirar");
     }
   });
 
-  // Cuando un jugador se desconecta
+  // ===== DISCONNECT: Cuando un jugador se desconecta =====
   socket.on("disconnect", async () => {
-    logger.info(`[${instanceName}] Cliente desconectado: ${socket.id}`);
+    try {
+      logger.info(`[${instanceName}] 🔌 Cliente desconectado: ${socket.id}`);
 
-    if (gameManager) {
       await gameManager.removePlayer(socket.id);
 
-      // Verificar jugadores en Redis (no solo locales)
-      const totalPlayers = await gameManager.getTotalPlayersCount();
-
-      if (totalPlayers === 0) {
-        logger.info(
-          `[${instanceName}] No quedan jugadores en el sistema - Deteniendo GameManager`
-        );
-        gameManager.stopGame();
-        gameManager = null;
-      } else {
-        logger.info(
-          `[${instanceName}] Todavía hay ${totalPlayers} jugador(es) en el sistema`
-        );
-      }
+      const playerCount = await gameManager.getPlayerCount();
+      logger.info(`[${instanceName}] 👥 Jugadores restantes: ${playerCount}`);
+    } catch (error) {
+      logger.error(`[${instanceName}] ❌ Error en disconnect:`, error);
     }
   });
 };

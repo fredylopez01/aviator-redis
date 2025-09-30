@@ -1,6 +1,4 @@
 const config = require("../config/gameConfig");
-const Player = require("./player");
-const Round = require("./round");
 const User = require("../models/User");
 const GameRound = require("../models/GameRound");
 const logger = require("../utils/logger");
@@ -9,13 +7,11 @@ const { getRedisClients } = require("../config/redis");
 class GameManager {
   constructor(io) {
     this.io = io;
-    this.players = {};
-    this.currentRound = null;
-    this.currentRoundDoc = null;
-    this.gameRunning = false;
-    this.crashCheckInterval = null;
     this.instanceName = process.env.INSTANCE_NAME || "backend";
     this.isLeader = false;
+    this.leaderHeartbeatInterval = null;
+    this.roundCheckInterval = null;
+
     this.setupRedis();
   }
 
@@ -26,111 +22,49 @@ class GameManager {
       this.publisher = publisher;
       this.subscriber = subscriber;
 
-      // ===== EVENTO: Inicio de ronda con timestamp =====
-      await this.subscriber.subscribe("game:round:start", async (message) => {
-        const data = JSON.parse(message);
-        this.currentRound = {
-          roundNumber: data.roundNumber,
-          startTime: data.startTime,
-          crashPoint: data.crashPoint, // Solo backends lo conocen
-          state: "running",
-        };
+      // ===== SUSCRIBIRSE A EVENTOS DE REDIS =====
 
-        // Guardar en Redis para que otros backends puedan recuperar
-        await this.client.set(
-          "game:current_round",
-          JSON.stringify(this.currentRound),
-          { EX: 300 } // 5 minutos
+      // Nueva ronda (periodo de apuestas)
+      await this.subscriber.subscribe("game:round:new", (message) => {
+        const data = JSON.parse(message);
+        logger.info(
+          `[${this.instanceName}] 🆕 Nueva ronda #${data.roundNumber}`
         );
 
-        Object.values(this.players).forEach((p) => p.resetForNextRound());
+        this.io.emit("round:new", {
+          roundNumber: data.roundNumber,
+          waitTimeMs: data.waitTimeMs,
+        });
+      });
 
-        // NO enviar crashPoint al frontend
+      // Inicio de ronda (despegar el avión)
+      await this.subscriber.subscribe("game:round:start", (message) => {
+        const data = JSON.parse(message);
+        logger.info(
+          `[${this.instanceName}] 🚀 Ronda #${data.roundNumber} iniciada`
+        );
+
         this.io.emit("round:start", {
           roundNumber: data.roundNumber,
           startTime: data.startTime,
-          // crashPoint NO se envía
         });
-
-        // Todos los backends verifican crash como fallback
-        this.startCrashCheck();
-
-        logger.info(
-          `[${this.instanceName}] Ronda ${data.roundNumber} iniciada - Crash en ${data.crashPoint}x`
-        );
       });
 
-      // ===== EVENTO: Crash de ronda =====
-      await this.subscriber.subscribe("game:round:crash", async (message) => {
+      // Crash de ronda
+      await this.subscriber.subscribe("game:round:crash", (message) => {
         const data = JSON.parse(message);
-
-        if (this.currentRound) {
-          this.currentRound.state = "crashed";
-        }
-
-        if (this.crashCheckInterval) {
-          clearInterval(this.crashCheckInterval);
-          this.crashCheckInterval = null;
-        }
-
-        // Limpiar ronda de Redis
-        await this.client.del("game:current_round");
+        logger.info(`[${this.instanceName}] 💥 Crash en ${data.crashPoint}x`);
 
         this.io.emit("round:crash", {
           roundNumber: data.roundNumber,
           crashPoint: data.crashPoint,
+          crashTime: data.crashTime,
         });
-
-        logger.info(
-          `[${this.instanceName}] Ronda ${data.roundNumber} crashed en ${data.crashPoint}x`
-        );
       });
 
-      // ===== EVENTO: Nueva ronda (período de espera) =====
-      await this.subscriber.subscribe("game:round:new", async (message) => {
+      // Apuesta realizada
+      await this.subscriber.subscribe("game:player:bet", (message) => {
         const data = JSON.parse(message);
-        this.currentRound = {
-          roundNumber: data.roundNumber,
-          state: "waiting",
-          crashPoint: data.crashPoint,
-        };
-
-        this.io.emit("round:new", {
-          roundNumber: data.roundNumber,
-          waitTime: data.waitTime,
-        });
-
-        logger.info(
-          `[${this.instanceName}] Nueva ronda ${data.roundNumber} - Esperando ${data.waitTime}ms`
-        );
-      });
-
-      // ===== EVENTO: Apuesta colocada =====
-      await this.subscriber.subscribe("game:bet:placed", async (message) => {
-        const data = JSON.parse(message);
-
-        if (this.players[data.socketId]) {
-          this.players[data.socketId].bet = data.amount;
-          this.players[data.socketId].balance = data.balance;
-        }
-
-        if (this.isLeader && this.currentRoundDoc) {
-          const exists = this.currentRoundDoc.bets.find(
-            (b) => b.socketId === data.socketId
-          );
-
-          if (!exists) {
-            this.currentRoundDoc.bets.push({
-              userId: data.userId || null,
-              playerName: data.playerName,
-              socketId: data.socketId,
-              amount: data.amount,
-              cashedOut: false,
-            });
-            this.currentRoundDoc.totalBetAmount += data.amount;
-            await this.currentRoundDoc.save();
-          }
-        }
 
         this.io.emit("player:bet", {
           socketId: data.socketId,
@@ -140,64 +74,45 @@ class GameManager {
         });
       });
 
-      // ===== EVENTO: Cashout ejecutado =====
-      await this.subscriber.subscribe(
-        "game:cashout:executed",
-        async (message) => {
-          const data = JSON.parse(message);
+      // Cashout realizado
+      await this.subscriber.subscribe("game:player:cashout", (message) => {
+        const data = JSON.parse(message);
 
-          if (this.players[data.socketId]) {
-            this.players[data.socketId].cashedOut = true;
-            this.players[data.socketId].win = data.winAmount;
-            this.players[data.socketId].balance = data.balance;
-          }
+        // Notificar al jugador específico
+        this.io.to(data.socketId).emit("cashout:success", {
+          winAmount: data.winAmount,
+          multiplier: data.multiplier,
+        });
 
-          if (this.isLeader && this.currentRoundDoc) {
-            const betIndex = this.currentRoundDoc.bets.findIndex(
-              (bet) => bet.socketId === data.socketId
-            );
+        // Notificar a todos
+        this.io.emit("player:cashout", {
+          socketId: data.socketId,
+          playerName: data.playerName,
+          winAmount: data.winAmount,
+          multiplier: data.multiplier,
+        });
+      });
 
-            if (betIndex !== -1) {
-              this.currentRoundDoc.bets[betIndex].cashedOut = true;
-              this.currentRoundDoc.bets[betIndex].winAmount = data.winAmount;
-              this.currentRoundDoc.bets[betIndex].cashoutMultiplier =
-                data.multiplier;
-              await this.currentRoundDoc.save();
-            }
-          }
+      // Actualización de lista de jugadores
+      await this.subscriber.subscribe("game:players:update", (message) => {
+        const players = JSON.parse(message);
+        this.io.emit("players:update", players);
+      });
 
-          this.io.to(data.socketId).emit("cashout:success", {
-            winAmount: data.winAmount,
-            multiplier: data.multiplier,
-          });
-
-          this.io.emit("player:cashout", {
-            socketId: data.socketId,
-            playerName: data.playerName,
-            winAmount: data.winAmount,
-            multiplier: data.multiplier,
-          });
-        }
-      );
-
-      // ===== EVENTO: Actualización de jugadores =====
-      await this.subscriber.subscribe(
-        "game:players:update",
-        async (message) => {
-          const players = JSON.parse(message);
-          this.io.emit("players:update", players);
-        }
-      );
-
+      // Intentar convertirse en líder
       await this.tryBecomeLeader();
-      logger.info(`[${this.instanceName}] Redis configurado correctamente`);
+
+      logger.info(`[${this.instanceName}] ✅ Redis configurado`);
     } catch (error) {
-      logger.error("Error configurando Redis:", error);
+      logger.error(`[${this.instanceName}] ❌ Error en setupRedis:`, error);
     }
   }
 
+  // ===== SISTEMA DE LIDERAZGO =====
+
   async tryBecomeLeader() {
     try {
+      // Intentar tomar el lock de líder (expira en 10 segundos)
       const result = await this.client.set("game:leader", this.instanceName, {
         NX: true,
         EX: 10,
@@ -205,195 +120,238 @@ class GameManager {
 
       if (result) {
         this.isLeader = true;
-        logger.info(`[${this.instanceName}] 👑 LÍDER ELEGIDO`);
+        logger.info(`[${this.instanceName}] 👑 SOY EL LÍDER`);
 
-        this.leaderInterval = setInterval(async () => {
-          try {
-            await this.client.expire("game:leader", 10);
-          } catch (error) {
-            logger.error("Error renovando liderazgo:", error);
-          }
+        // Renovar el lock cada 5 segundos
+        this.leaderHeartbeatInterval = setInterval(() => {
+          this.renewLeadership();
         }, 5000);
 
-        const playerCount = await this.getTotalPlayersCount();
-        if (playerCount > 0 && !this.gameRunning) {
-          this.startNewRound();
-        }
+        // Iniciar el verificador de rondas
+        this.startRoundChecker();
       } else {
         this.isLeader = false;
-        logger.info(`[${this.instanceName}] 📡 Seguidor activo`);
+        logger.info(`[${this.instanceName}] 📡 Modo seguidor`);
+
+        // Intentar ser líder cada 10 segundos si el actual falla
+        setTimeout(() => this.tryBecomeLeader(), 10000);
       }
     } catch (error) {
-      logger.error("Error en tryBecomeLeader:", error);
+      logger.error(`[${this.instanceName}] Error en tryBecomeLeader:`, error);
     }
   }
 
-  async startNewRound() {
+  async renewLeadership() {
+    try {
+      await this.client.expire("game:leader", 10);
+    } catch (error) {
+      logger.error(`[${this.instanceName}] Error renovando liderazgo:`, error);
+      this.isLeader = false;
+      clearInterval(this.leaderHeartbeatInterval);
+      clearInterval(this.roundCheckInterval);
+      this.tryBecomeLeader();
+    }
+  }
+
+  // ===== LÓGICA DEL LÍDER: CONTROL DE RONDAS =====
+
+  startRoundChecker() {
+    if (!this.isLeader) return;
+
+    // Verificar cada 500ms si hay que iniciar/crashear una ronda
+    this.roundCheckInterval = setInterval(() => {
+      this.checkRoundStatus();
+    }, 500);
+
+    // Iniciar primera ronda si no hay ninguna
+    this.checkRoundStatus();
+  }
+
+  async checkRoundStatus() {
     if (!this.isLeader) return;
 
     try {
-      this.gameRunning = true;
+      const roundData = await this.client.get("game:round:current");
 
-      const crashPoint = this.generateCrashPoint();
-      const roundNumber = await this.getNextRoundNumber();
-
-      const playerKeys = await this.client.keys("player:*");
-      for (const key of playerKeys) {
-        await this.client.hSet(key, {
-          bet: "0",
-          cashedOut: "false",
-          win: "0",
-        });
+      if (!roundData) {
+        // No hay ronda activa, crear una nueva
+        const playerCount = await this.getPlayerCount();
+        if (playerCount > 0) {
+          await this.createNewRound();
+        }
+        return;
       }
 
-      this.currentRoundDoc = new GameRound({
-        roundNumber: roundNumber,
-        crashPoint: crashPoint,
-        state: "waiting",
-        startTime: new Date(),
-      });
-      await this.currentRoundDoc.save();
+      const round = JSON.parse(roundData);
+      const now = Date.now();
 
+      if (round.state === "waiting" && now >= round.startTime) {
+        // Es hora de iniciar la ronda
+        await this.startRound(round);
+      } else if (round.state === "running" && now >= round.crashTime) {
+        // Es hora de crashear
+        await this.crashRound(round);
+      }
+    } catch (error) {
+      logger.error(`[${this.instanceName}] Error en checkRoundStatus:`, error);
+    }
+  }
+
+  async createNewRound() {
+    try {
+      const roundNumber = await this.getNextRoundNumber();
+      const crashPoint = this.generateCrashPoint();
+
+      const now = Date.now();
+      const waitTimeMs = 5000; // 5 segundos para apostar
+      const startTime = now + waitTimeMs;
+
+      // Calcular duración de la ronda basado en el crash point
+      // crashPoint = 1.0 + (ticks * 0.01)
+      // ticks = (crashPoint - 1.0) / 0.01
+      const ticks = (crashPoint - 1.0) / config.tickIncrement;
+      const durationMs = ticks * config.tickInterval;
+      const crashTime = startTime + durationMs;
+
+      const round = {
+        roundNumber,
+        crashPoint,
+        state: "waiting",
+        createdAt: now,
+        startTime,
+        crashTime,
+      };
+
+      // Guardar en Redis
+      await this.client.set("game:round:current", JSON.stringify(round), {
+        EX: 300, // 5 minutos
+      });
+
+      // Crear documento en MongoDB
+      const roundDoc = new GameRound({
+        roundNumber,
+        crashPoint,
+        state: "waiting",
+        startTime: new Date(startTime),
+        crashTime: new Date(crashTime),
+      });
+      await roundDoc.save();
+
+      // Resetear apuestas de todos los jugadores
+      await this.resetAllPlayerBets();
+
+      // Notificar a todos los backends
       await this.publisher.publish(
         "game:round:new",
         JSON.stringify({
-          roundNumber: roundNumber,
-          crashPoint: crashPoint,
-          waitTime: config.waitTime,
+          roundNumber,
+          waitTimeMs,
         })
       );
 
       await this.publishPlayersUpdate();
 
-      setTimeout(() => {
-        if (this.isLeader && this.gameRunning) {
-          this.startRoundExecution(roundNumber, crashPoint);
-        }
-      }, config.waitTime);
+      logger.info(
+        `[${
+          this.instanceName
+        }] 🎲 Ronda #${roundNumber} creada - Crash: ${crashPoint}x en ${(
+          durationMs / 1000
+        ).toFixed(1)}s`
+      );
     } catch (error) {
-      logger.error("Error iniciando nueva ronda:", error);
+      logger.error(`[${this.instanceName}] Error creando ronda:`, error);
     }
   }
 
-  async startRoundExecution(roundNumber, crashPoint) {
-    if (!this.isLeader) return;
-
+  async startRound(round) {
     try {
-      const startTime = Date.now();
+      round.state = "running";
+      await this.client.set("game:round:current", JSON.stringify(round), {
+        EX: 300,
+      });
 
-      if (this.currentRoundDoc) {
-        this.currentRoundDoc.state = "running";
-        this.currentRoundDoc.actualStartTime = new Date(startTime);
-        await this.currentRoundDoc.save();
-      }
+      // Actualizar MongoDB
+      await GameRound.findOneAndUpdate(
+        { roundNumber: round.roundNumber },
+        { state: "running", actualStartTime: new Date() }
+      );
 
+      // Notificar inicio
       await this.publisher.publish(
         "game:round:start",
         JSON.stringify({
-          roundNumber: roundNumber,
-          startTime: startTime,
-          crashPoint: crashPoint,
+          roundNumber: round.roundNumber,
+          startTime: round.startTime,
         })
       );
+
+      logger.info(
+        `[${this.instanceName}] ▶️ Ronda #${round.roundNumber} iniciada`
+      );
     } catch (error) {
-      logger.error("Error ejecutando ronda:", error);
+      logger.error(`[${this.instanceName}] Error iniciando ronda:`, error);
     }
   }
 
-  // Todos los backends verifican crash como fallback
-  startCrashCheck() {
-    if (!this.currentRound) return;
-
-    if (this.crashCheckInterval) {
-      clearInterval(this.crashCheckInterval);
-    }
-
-    this.crashCheckInterval = setInterval(async () => {
-      if (!this.currentRound || this.currentRound.state !== "running") {
-        clearInterval(this.crashCheckInterval);
-        this.crashCheckInterval = null;
-        return;
-      }
-
-      const currentMultiplier = this.calculateCurrentMultiplier();
-
-      if (currentMultiplier >= this.currentRound.crashPoint) {
-        // Si soy líder, ejecuto el crash
-        if (this.isLeader) {
-          await this.executeCrash();
-        } else {
-          // Si NO soy líder, intento convertirme en líder de emergencia
-          const leader = await this.client.get("game:leader");
-          if (!leader) {
-            logger.warn(`[${this.instanceName}] Líder caído, tomando control`);
-            await this.tryBecomeLeader();
-            if (this.isLeader) {
-              await this.executeCrash();
-            }
-          }
-        }
-      }
-    }, 100);
-  }
-
-  calculateCurrentMultiplier() {
-    if (!this.currentRound || !this.currentRound.startTime) return 1.0;
-
-    const elapsed = Date.now() - this.currentRound.startTime;
-    if (elapsed < 0) return 1.0;
-
-    const ticks = Math.floor(elapsed / config.tickInterval);
-    return parseFloat((1.0 + ticks * config.tickIncrement).toFixed(2));
-  }
-
-  async executeCrash() {
-    if (!this.currentRound) return;
-
+  async crashRound(round) {
     try {
-      clearInterval(this.crashCheckInterval);
-      this.crashCheckInterval = null;
+      round.state = "crashed";
+      await this.client.set("game:round:current", JSON.stringify(round), {
+        EX: 60, // 1 minuto
+      });
 
-      this.currentRound.state = "crashed";
+      // Actualizar MongoDB
+      const roundDoc = await GameRound.findOneAndUpdate(
+        { roundNumber: round.roundNumber },
+        {
+          state: "crashed",
+          maxMultiplier: round.crashPoint,
+        },
+        { new: true }
+      );
 
-      if (this.currentRoundDoc) {
-        this.currentRoundDoc.state = "crashed";
-        this.currentRoundDoc.crashTime = new Date();
-        this.currentRoundDoc.maxMultiplier = this.currentRound.crashPoint;
-
+      // Calcular ganancias totales
+      if (roundDoc) {
         let totalWinAmount = 0;
-        this.currentRoundDoc.bets.forEach((bet) => {
+        roundDoc.bets.forEach((bet) => {
           if (bet.cashedOut) {
             totalWinAmount += bet.winAmount;
           }
         });
-        this.currentRoundDoc.totalWinAmount = totalWinAmount;
-        await this.currentRoundDoc.save();
+        roundDoc.totalWinAmount = totalWinAmount;
+        await roundDoc.save();
       }
 
+      // Notificar crash
       await this.publisher.publish(
         "game:round:crash",
         JSON.stringify({
-          roundNumber: this.currentRound.roundNumber,
-          crashPoint: this.currentRound.crashPoint,
+          roundNumber: round.roundNumber,
+          crashPoint: round.crashPoint,
+          crashTime: round.crashTime,
         })
       );
 
-      await this.publishPlayersUpdate();
+      logger.info(
+        `[${this.instanceName}] 💥 Ronda #${round.roundNumber} crashed en ${round.crashPoint}x`
+      );
 
-      setTimeout(async () => {
-        const playerCount = await this.getTotalPlayersCount();
-        if (this.isLeader && this.gameRunning && playerCount > 0) {
-          this.startNewRound();
+      // Esperar 3 segundos y crear nueva ronda
+      setTimeout(() => {
+        if (this.isLeader) {
+          this.client.del("game:round:current");
         }
       }, 3000);
     } catch (error) {
-      logger.error("Error ejecutando crash:", error);
+      logger.error(`[${this.instanceName}] Error en crash:`, error);
     }
   }
 
-  async addPlayer(id, name) {
+  // ===== ACCIONES DE JUGADORES =====
+
+  async addPlayer(socketId, name) {
     try {
-      let user = await User.findOne({ socketId: id });
+      let user = await User.findOne({ socketId });
 
       if (user) {
         user.isActive = true;
@@ -401,172 +359,252 @@ class GameManager {
         await user.save();
       } else {
         user = new User({
-          socketId: id,
-          name: name,
+          socketId,
+          name,
           balance: config.initialBalance,
         });
         await user.save();
       }
 
-      this.players[id] = new Player(id, user.name, user.balance);
-
-      await this.client.hSet(`player:${id}`, {
-        id: id,
+      // Guardar en Redis
+      await this.client.hSet(`player:${socketId}`, {
+        id: socketId,
         name: user.name,
         balance: user.balance.toString(),
         bet: "0",
         cashedOut: "false",
         win: "0",
       });
-      await this.client.expire(`player:${id}`, 3600);
+      await this.client.expire(`player:${socketId}`, 3600);
 
       await this.publishPlayersUpdate();
 
-      if (this.isLeader && !this.gameRunning) {
-        this.startNewRound();
-      }
+      logger.info(`[${this.instanceName}] ➕ Jugador añadido: ${name}`);
 
       return user;
     } catch (error) {
-      logger.error("Error agregando jugador:", error);
+      logger.error(`[${this.instanceName}] Error añadiendo jugador:`, error);
       throw error;
     }
   }
 
-  async removePlayer(id) {
+  async removePlayer(socketId) {
     try {
       await User.findOneAndUpdate(
-        { socketId: id },
+        { socketId },
         { isActive: false, lastActivity: new Date() }
       );
 
-      delete this.players[id];
-      await this.client.del(`player:${id}`);
+      await this.client.del(`player:${socketId}`);
       await this.publishPlayersUpdate();
 
-      logger.info(`[${this.instanceName}] Usuario desconectado: ${id}`);
+      logger.info(`[${this.instanceName}] ➖ Jugador eliminado: ${socketId}`);
     } catch (error) {
-      logger.error("Error removiendo jugador:", error);
+      logger.error(`[${this.instanceName}] Error eliminando jugador:`, error);
     }
   }
 
-  async placeBet(id, amount) {
-    if (!this.currentRound || this.currentRound.state !== "waiting") {
-      return false;
-    }
-
+  async placeBet(socketId, amount) {
     try {
-      const player = this.players[id];
-      if (!player || amount < config.minBet || amount > config.maxBet) {
-        return false;
+      // Verificar que la ronda esté en estado "waiting"
+      const roundData = await this.client.get("game:round:current");
+      if (!roundData) return { success: false, error: "No hay ronda activa" };
+
+      const round = JSON.parse(roundData);
+      if (round.state !== "waiting") {
+        return { success: false, error: "No puedes apostar ahora" };
       }
 
-      if (player.placeBet(amount)) {
-        const user = await User.findOneAndUpdate(
-          { socketId: id },
+      // Obtener jugador de Redis
+      const playerData = await this.client.hGetAll(`player:${socketId}`);
+      if (!playerData || !playerData.id) {
+        return { success: false, error: "Jugador no encontrado" };
+      }
+
+      const balance = parseFloat(playerData.balance) || 0;
+      const currentBet = parseFloat(playerData.bet) || 0;
+
+      if (currentBet > 0) {
+        return { success: false, error: "Ya tienes una apuesta activa" };
+      }
+
+      if (amount < config.minBet || amount > config.maxBet) {
+        return { success: false, error: "Monto inválido" };
+      }
+
+      if (amount > balance) {
+        return { success: false, error: "Saldo insuficiente" };
+      }
+
+      // Actualizar balance y apuesta
+      const newBalance = balance - amount;
+      await this.client.hSet(`player:${socketId}`, {
+        balance: newBalance.toString(),
+        bet: amount.toString(),
+      });
+
+      // Actualizar MongoDB
+      const user = await User.findOneAndUpdate(
+        { socketId },
+        {
+          balance: newBalance,
+          $inc: { totalBets: amount },
+          lastActivity: new Date(),
+        },
+        { new: true }
+      );
+
+      // Agregar apuesta al documento de ronda
+      if (this.isLeader) {
+        await GameRound.findOneAndUpdate(
+          { roundNumber: round.roundNumber },
           {
-            balance: player.balance,
-            $inc: { totalBets: amount },
-            lastActivity: new Date(),
-          },
-          { new: true }
+            $push: {
+              bets: {
+                userId: user._id,
+                playerName: playerData.name,
+                socketId,
+                amount,
+                cashedOut: false,
+              },
+            },
+            $inc: { totalBetAmount: amount },
+          }
         );
-
-        await this.client.hSet(`player:${id}`, {
-          balance: player.balance.toString(),
-          bet: amount.toString(),
-        });
-
-        await this.publisher.publish(
-          "game:bet:placed",
-          JSON.stringify({
-            socketId: id,
-            userId: user._id.toString(),
-            playerName: player.name,
-            amount: amount,
-            balance: player.balance,
-          })
-        );
-
-        logger.info(
-          `[${this.instanceName}] Apuesta: ${player.name} - $${amount}`
-        );
-        return true;
       }
-      return false;
+
+      // Publicar evento de apuesta
+      await this.publisher.publish(
+        "game:player:bet",
+        JSON.stringify({
+          socketId,
+          playerName: playerData.name,
+          amount,
+          balance: newBalance,
+        })
+      );
+
+      logger.info(
+        `[${this.instanceName}] 🎯 Apuesta: ${playerData.name} - $${amount}`
+      );
+
+      return { success: true, balance: newBalance };
     } catch (error) {
-      logger.error("Error procesando apuesta:", error);
-      return false;
+      logger.error(`[${this.instanceName}] Error en placeBet:`, error);
+      return { success: false, error: "Error interno" };
     }
   }
 
-  async cashout(id) {
-    if (!this.currentRound || this.currentRound.state !== "running") {
-      return { success: false, error: "No hay ronda en progreso" };
-    }
-
-    const player = this.players[id];
-    if (!player) {
-      return { success: false, error: "Jugador no encontrado" };
-    }
-
+  async cashout(socketId) {
     try {
-      const redisPlayerData = await this.client.hGetAll(`player:${id}`);
-
-      if (redisPlayerData.cashedOut === "true") {
-        return { success: false, error: "Ya te retiraste" };
+      // Verificar que la ronda esté "running"
+      const roundData = await this.client.get("game:round:current");
+      if (!roundData) {
+        return { success: false, error: "No hay ronda activa" };
       }
 
-      const currentBet = parseFloat(redisPlayerData.bet) || 0;
-      if (currentBet <= 0) {
+      const round = JSON.parse(roundData);
+      if (round.state !== "running") {
+        return { success: false, error: "No hay ronda en progreso" };
+      }
+
+      // Obtener datos del jugador
+      const playerData = await this.client.hGetAll(`player:${socketId}`);
+      if (!playerData || !playerData.id) {
+        return { success: false, error: "Jugador no encontrado" };
+      }
+
+      const bet = parseFloat(playerData.bet) || 0;
+      const cashedOut = playerData.cashedOut === "true";
+
+      if (bet <= 0) {
         return { success: false, error: "No tienes apuesta activa" };
       }
 
-      const currentMultiplier = this.calculateCurrentMultiplier();
-      const winAmount = currentBet * currentMultiplier;
+      if (cashedOut) {
+        return { success: false, error: "Ya te retiraste" };
+      }
 
-      player.balance += winAmount;
-      player.cashedOut = true;
-      player.win = winAmount;
+      // Calcular multiplicador actual
+      const multiplier = this.calculateMultiplier(round.startTime);
 
+      // Verificar que no haya pasado el crash point
+      if (multiplier >= round.crashPoint) {
+        return { success: false, error: "Demasiado tarde, ya crasheó" };
+      }
+
+      const winAmount = bet * multiplier;
+      const balance = parseFloat(playerData.balance) || 0;
+      const newBalance = balance + winAmount;
+
+      // Actualizar Redis
+      await this.client.hSet(`player:${socketId}`, {
+        balance: newBalance.toString(),
+        cashedOut: "true",
+        win: winAmount.toString(),
+      });
+
+      // Actualizar MongoDB
       const user = await User.findOneAndUpdate(
-        { socketId: id },
+        { socketId },
         {
-          balance: player.balance,
+          balance: newBalance,
           $inc: { totalWins: winAmount },
           lastActivity: new Date(),
         },
         { new: true }
       );
 
-      await this.client.hSet(`player:${id}`, {
-        balance: player.balance.toString(),
-        cashedOut: "true",
-        win: winAmount.toString(),
-      });
+      // Actualizar apuesta en ronda
+      if (this.isLeader) {
+        await GameRound.findOneAndUpdate(
+          {
+            roundNumber: round.roundNumber,
+            "bets.socketId": socketId,
+          },
+          {
+            $set: {
+              "bets.$.cashedOut": true,
+              "bets.$.cashoutMultiplier": multiplier,
+              "bets.$.winAmount": winAmount,
+            },
+          }
+        );
+      }
 
+      // Publicar evento de cashout
       await this.publisher.publish(
-        "game:cashout:executed",
+        "game:player:cashout",
         JSON.stringify({
-          socketId: id,
-          userId: user._id.toString(),
-          playerName: player.name,
-          winAmount: winAmount,
-          multiplier: currentMultiplier,
-          balance: player.balance,
+          socketId,
+          playerName: playerData.name,
+          winAmount,
+          multiplier,
+          balance: newBalance,
         })
       );
 
       logger.info(
-        `[${this.instanceName}] Cashout: ${player.name} - $${winAmount.toFixed(
-          2
-        )} (${currentMultiplier}x)`
+        `[${this.instanceName}] 💰 Cashout: ${
+          playerData.name
+        } - $${winAmount.toFixed(2)} (${multiplier.toFixed(2)}x)`
       );
-      return { success: true, winAmount, multiplier: currentMultiplier };
+
+      return { success: true, winAmount, multiplier };
     } catch (error) {
-      logger.error("Error en cashout:", error);
+      logger.error(`[${this.instanceName}] Error en cashout:`, error);
       return { success: false, error: "Error interno" };
     }
+  }
+
+  // ===== UTILIDADES =====
+
+  calculateMultiplier(startTime) {
+    const elapsed = Date.now() - startTime;
+    if (elapsed < 0) return 1.0;
+
+    const ticks = Math.floor(elapsed / config.tickInterval);
+    return parseFloat((1.0 + ticks * config.tickIncrement).toFixed(2));
   }
 
   generateCrashPoint() {
@@ -577,32 +615,48 @@ class GameManager {
     );
   }
 
+  async resetAllPlayerBets() {
+    const playerKeys = await this.client.keys("player:*");
+    for (const key of playerKeys) {
+      await this.client.hSet(key, {
+        bet: "0",
+        cashedOut: "false",
+        win: "0",
+      });
+    }
+  }
+
   async publishPlayersUpdate() {
     try {
       const playerKeys = await this.client.keys("player:*");
-      const playersArray = [];
+      const players = [];
 
       for (const key of playerKeys) {
-        const playerData = await this.client.hGetAll(key);
-        if (playerData && playerData.id) {
-          playersArray.push({
-            id: playerData.id,
-            name: playerData.name,
-            balance: parseFloat(playerData.balance) || 0,
-            bet: parseFloat(playerData.bet) || 0,
-            cashedOut: playerData.cashedOut === "true",
-            win: parseFloat(playerData.win) || 0,
+        const data = await this.client.hGetAll(key);
+        if (data && data.id) {
+          players.push({
+            id: data.id,
+            name: data.name,
+            balance: parseFloat(data.balance) || 0,
+            bet: parseFloat(data.bet) || 0,
+            cashedOut: data.cashedOut === "true",
+            win: parseFloat(data.win) || 0,
           });
         }
       }
 
       await this.publisher.publish(
         "game:players:update",
-        JSON.stringify(playersArray)
+        JSON.stringify(players)
       );
     } catch (error) {
-      logger.error("Error publicando jugadores:", error);
+      logger.error(`[${this.instanceName}] Error publicando jugadores:`, error);
     }
+  }
+
+  async getPlayerCount() {
+    const keys = await this.client.keys("player:*");
+    return keys.length;
   }
 
   async getNextRoundNumber() {
@@ -610,89 +664,60 @@ class GameManager {
       const lastRound = await GameRound.findOne().sort({ roundNumber: -1 });
       return lastRound ? lastRound.roundNumber + 1 : 1;
     } catch (error) {
-      logger.error("Error obteniendo número de ronda:", error);
       return 1;
     }
   }
 
-  async getGameState() {
+  async getGameState(socketId) {
     const playerKeys = await this.client.keys("player:*");
-    const playersArray = [];
+    const players = [];
 
     for (const key of playerKeys) {
-      const playerData = await this.client.hGetAll(key);
-      if (playerData && playerData.id) {
-        playersArray.push({
-          id: playerData.id,
-          name: playerData.name,
-          balance: parseFloat(playerData.balance) || 0,
-          bet: parseFloat(playerData.bet) || 0,
-          cashedOut: playerData.cashedOut === "true",
-          win: parseFloat(playerData.win) || 0,
+      const data = await this.client.hGetAll(key);
+      if (data && data.id) {
+        players.push({
+          id: data.id,
+          name: data.name,
+          balance: parseFloat(data.balance) || 0,
+          bet: parseFloat(data.bet) || 0,
+          cashedOut: data.cashedOut === "true",
+          win: parseFloat(data.win) || 0,
         });
       }
     }
 
-    // Recuperar ronda actual de Redis si existe
+    // Obtener ronda actual
     let roundInfo = { state: "waiting", multiplier: 1.0 };
 
-    try {
-      const roundData = await this.client.get("game:current_round");
-      if (roundData) {
-        const round = JSON.parse(roundData);
-        // Calcular multiplicador actual basado en timestamp
-        const currentMultiplier =
-          this.calculateCurrentMultiplierFromRound(round);
-        roundInfo = {
-          roundNumber: round.roundNumber,
-          state: round.state,
-          multiplier: currentMultiplier,
-          startTime: round.startTime,
-          // NO enviar crashPoint
-        };
+    const roundData = await this.client.get("game:round:current");
+    if (roundData) {
+      const round = JSON.parse(roundData);
+      roundInfo = {
+        roundNumber: round.roundNumber,
+        state: round.state,
+        startTime: round.startTime,
+      };
+
+      if (round.state === "running") {
+        roundInfo.multiplier = this.calculateMultiplier(round.startTime);
       }
-    } catch (error) {
-      logger.error("Error obteniendo estado de ronda:", error);
     }
 
-    return {
-      round: roundInfo,
-      players: playersArray,
-    };
-  }
-
-  calculateCurrentMultiplierFromRound(round) {
-    if (!round || !round.startTime) return 1.0;
-
-    const elapsed = Date.now() - round.startTime;
-    if (elapsed < 0) return 1.0;
-
-    const ticks = Math.floor(elapsed / config.tickInterval);
-    return parseFloat((1.0 + ticks * config.tickIncrement).toFixed(2));
-  }
-
-  async getTotalPlayersCount() {
-    try {
-      const playerKeys = await this.client.keys("player:*");
-      return playerKeys.length;
-    } catch (error) {
-      return 0;
-    }
+    return { round: roundInfo, players };
   }
 
   stopGame() {
-    logger.info(`[${this.instanceName}] Deteniendo GameManager...`);
-    this.gameRunning = false;
+    logger.info(`[${this.instanceName}] 🛑 Deteniendo GameManager`);
 
-    if (this.crashCheckInterval) {
-      clearInterval(this.crashCheckInterval);
-      this.crashCheckInterval = null;
+    if (this.leaderHeartbeatInterval) {
+      clearInterval(this.leaderHeartbeatInterval);
     }
 
-    if (this.leaderInterval) {
-      clearInterval(this.leaderInterval);
-      this.leaderInterval = null;
+    if (this.roundCheckInterval) {
+      clearInterval(this.roundCheckInterval);
     }
+
+    this.isLeader = false;
   }
 }
 
