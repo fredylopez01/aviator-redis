@@ -1,12 +1,11 @@
-// backend/src/game/LeaderElection.js
 const logger = require("../utils/logger");
 
 class LeaderElection {
   constructor(redisService, instanceName) {
-    this.redis = redisService;
-    this.instanceName = instanceName;
-    this.isLeader = false;
-    this.heartbeatInterval = null;
+    this.redis = redisService; // Servicio Redis para la comunicación.
+    this.instanceName = instanceName; // Nombre único de esta instancia (ej. backend-1).
+    this.isLeader = false; // Bandera que indica el estado actual.
+    this.heartbeatInterval = null; // ID del temporizador para mantener el liderazgo.
   }
 
   /**
@@ -14,22 +13,24 @@ class LeaderElection {
    */
   async tryBecomeLeader() {
     try {
+      // Intenta adquirir el 'lock' de liderazgo en Redis.
+      // Usa un TTL de **5 segundos**.
       const acquired = await this.redis.tryAcquireLeadership(
         this.instanceName,
-        10
+        5 // TTL: Si la instancia falla, la llave expira en 5 segundos.
       );
 
       if (acquired) {
         this.isLeader = true;
         logger.info(`[${this.instanceName}] 👑 SOY EL LÍDER`);
+        // Inicia el mecanismo de Heartbeat para renovar el 'lock'.
         this.startHeartbeat();
         return true;
       } else {
         this.isLeader = false;
         logger.info(`[${this.instanceName}] 📡 Modo seguidor`);
-
-        // Reintentar en 10 segundos
-        setTimeout(() => this.tryBecomeLeader(), 10000);
+        // Si falla la adquisición (otro es el líder), reintenta en 5 segundos.
+        setTimeout(() => this.tryBecomeLeader(), 5000);
         return false;
       }
     } catch (error) {
@@ -46,17 +47,20 @@ class LeaderElection {
       clearInterval(this.heartbeatInterval);
     }
 
+    // **setInterval**: Configura un latido periódico.
     this.heartbeatInterval = setInterval(async () => {
       try {
-        await this.redis.renewLeadership(10);
+        // Renueva el TTL de la llave "game:leader" a 5 segundos.
+        await this.redis.renewLeadership(5);
       } catch (error) {
         logger.error(
           `[${this.instanceName}] Error renovando liderazgo:`,
           error
         );
+        // Si falla la renovación (ej. Redis cayó), asume que perdió el liderazgo.
         this.loseLeadership();
       }
-    }, 5000);
+    }, 3000);
   }
 
   /**
@@ -65,13 +69,12 @@ class LeaderElection {
   loseLeadership() {
     logger.warn(`[${this.instanceName}] ⚠️ Perdí el liderazgo`);
     this.isLeader = false;
-
+    // Detiene el Heartbeat.
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
-
-    // Reintentar ser líder
+    // Reintenta adquirir el liderazgo después de 1 segundo (rápida transición).
     setTimeout(() => this.tryBecomeLeader(), 1000);
   }
 
@@ -79,6 +82,7 @@ class LeaderElection {
    * Detiene el proceso de liderazgo
    */
   stop() {
+    // Limpieza al cerrar la instancia.
     if (this.heartbeatInterval) {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
