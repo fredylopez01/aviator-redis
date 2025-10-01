@@ -1,41 +1,15 @@
-// frontend/src/hooks/useGameState.ts
-import { useState } from "react";
+import { useState, useCallback } from "react";
+import { Player, RoundState } from "../types/types";
 
-export interface Player {
-  id: string;
-  name: string;
-  balance: number;
-  bet: number;
-  cashedOut: boolean;
-  win: number;
-}
-
-interface UseGameStateReturn {
-  roundState: string;
-  setRoundState: (state: string) => void;
-  roundNumber: number;
-  setRoundNumber: (num: number) => void;
-  players: Player[];
-  setPlayers: (players: Player[]) => void;
-  currentPlayer: Player | null;
-  setCurrentPlayer: (player: Player | null) => void;
-  message: string;
-  setMessage: (msg: string) => void;
-  gameInitialized: boolean;
-  setGameInitialized: (init: boolean) => void;
-  resetPlayerBets: () => void;
-}
-
-export const useGameState = (): UseGameStateReturn => {
-  const [roundState, setRoundState] = useState<string>("waiting");
+export const useGameState = () => {
+  const [roundState, setRoundState] = useState<RoundState>("waiting");
   const [roundNumber, setRoundNumber] = useState<number>(0);
   const [players, setPlayers] = useState<Player[]>([]);
   const [currentPlayer, setCurrentPlayer] = useState<Player | null>(null);
   const [message, setMessage] = useState<string>("");
   const [gameInitialized, setGameInitialized] = useState<boolean>(false);
 
-  // Resetea las apuestas del jugador actual para nueva ronda
-  const resetPlayerBets = () => {
+  const resetPlayerBets = useCallback(() => {
     if (currentPlayer) {
       setCurrentPlayer({
         ...currentPlayer,
@@ -44,7 +18,18 @@ export const useGameState = (): UseGameStateReturn => {
         win: 0,
       });
     }
-  };
+  }, [currentPlayer]);
+
+  const updateCurrentPlayerFromList = useCallback(
+    (socketId: string) => {
+      const player = players.find((p) => p.id === socketId);
+      if (player) {
+        console.log("🔄 Actualizando currentPlayer desde lista:", player);
+        setCurrentPlayer(player);
+      }
+    },
+    [players]
+  );
 
   return {
     roundState,
@@ -60,5 +45,6 @@ export const useGameState = (): UseGameStateReturn => {
     gameInitialized,
     setGameInitialized,
     resetPlayerBets,
+    updateCurrentPlayerFromList,
   };
 };
