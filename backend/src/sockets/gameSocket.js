@@ -1,3 +1,4 @@
+// backend/src/sockets/gameSocket.js
 const GameManager = require("../game/gameManager");
 const logger = require("../utils/logger");
 
@@ -15,18 +16,14 @@ module.exports = (io, socket) => {
     logger.info(`[${instanceName}] 🎮 GameManager inicializado`);
   }
 
-  // ===== JOIN: Cuando un jugador se une =====
+  // ===== JOIN =====
   socket.on("join", async (name) => {
     try {
       logger.info(`[${instanceName}] 👤 ${name} se unió (${socket.id})`);
 
-      // Agregar jugador
       const user = await gameManager.addPlayer(socket.id, name);
+      const gameState = await gameManager.getGameState();
 
-      // Obtener estado actual del juego
-      const gameState = await gameManager.getGameState(socket.id);
-
-      // Enviar confirmación al cliente
       socket.emit("joined", {
         player: {
           id: socket.id,
@@ -46,18 +43,13 @@ module.exports = (io, socket) => {
     }
   });
 
-  // ===== BET: Cuando un jugador apuesta =====
+  // ===== BET =====
   socket.on("bet", async (amount) => {
     try {
       logger.info(`[${instanceName}] 🎯 Apuesta de ${socket.id}: $${amount}`);
 
       const result = await gameManager.placeBet(socket.id, amount);
-
       socket.emit("bet:result", result);
-
-      if (result.success) {
-        await gameManager.publishPlayersUpdate();
-      }
     } catch (error) {
       logger.error(`[${instanceName}] ❌ Error en bet:`, error);
       socket.emit("bet:result", {
@@ -67,7 +59,7 @@ module.exports = (io, socket) => {
     }
   });
 
-  // ===== CASHOUT: Cuando un jugador se retira =====
+  // ===== CASHOUT =====
   socket.on("cashout", async () => {
     try {
       logger.info(`[${instanceName}] 💰 Cashout de ${socket.id}`);
@@ -76,8 +68,6 @@ module.exports = (io, socket) => {
 
       if (!result.success) {
         socket.emit("cashout:failed", result.error);
-      } else {
-        await gameManager.publishPlayersUpdate();
       }
     } catch (error) {
       logger.error(`[${instanceName}] ❌ Error en cashout:`, error);
@@ -85,7 +75,7 @@ module.exports = (io, socket) => {
     }
   });
 
-  // ===== DISCONNECT: Cuando un jugador se desconecta =====
+  // ===== DISCONNECT =====
   socket.on("disconnect", async () => {
     try {
       logger.info(`[${instanceName}] 🔌 Cliente desconectado: ${socket.id}`);
