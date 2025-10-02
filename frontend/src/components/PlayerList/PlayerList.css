@@ -51,6 +51,12 @@
   font-style: italic;
 }
 
+@media screen and (max-width: 450px) {
+  .player-list {
+    width: 100%;
+  }
+}
+
 @media (max-width: 768px) {
   .game {
     grid-template-areas:

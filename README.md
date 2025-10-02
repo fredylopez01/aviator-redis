@@ -1,22 +1,77 @@
-# 🎮 Aviator Game - Sistema Distribuido con Alta Disponibilidad
+# 🎮🎲 Replicación y Alta Disponibilidad en un Juego de Apuestas en Tiempo Real
+
+## 📌 Introducción
+
+Este proyecto consiste en el diseño e implementación de una aplicación distribuida que simula una **sala de apuestas en tiempo real**, inspirada en el juego _Aviator_.
+El objetivo principal es garantizar la **alta disponibilidad** y la **consistencia de los datos** mediante un **clúster de bases de datos replicado** y un sistema tolerante a fallos en el backend.
+
+La aplicación permite que, aunque un nodo de la base de datos o del backend falle, el sistema siga operativo mediante **failover automático** y **reconexiones transparentes** para el usuario.
+
+## ⚙️ Tecnologías
+
+- **Backend:** Node.js
+- **Frontend:** React + TypeScript
+- **Base de datos:** MongoDB replicado (3 nodos – Maestro/Esclavos)
+- **Comunicación en tiempo real:** WebSockets
+- **Balanceo de carga:** Nginx
+- **Gestión de estado distribuido:** Redis (Pub/Sub)
+- **Contenedores y despliegue:** Docker & Docker Compose
+
+## 🎯 Objetivos del Laboratorio
+
+1. **Arquitectura Distribuida**
+
+   - Diseño de un sistema con nodos de backend, frontend y base de datos replicada.
+
+2. **Replicación y Failover de Base de Datos**
+
+   - Configurar replicación Maestro–Esclavo en MongoDB.
+   - Promoción automática de un esclavo cuando el maestro cae.
+
+3. **Backend (API de Apuestas)**
+
+   - Gestión de lógica del juego.
+   - Escrituras → Maestro | Lecturas → Esclavos.
+
+4. **Frontend (Sala en Tiempo Real)**
+
+   - Interfaz de usuario donde los jugadores realizan apuestas.
+   - Comunicación en tiempo real con WebSockets.
+
+5. **Alta Disponibilidad del Backend**
+
+   - Balanceo de carga con Nginx.
+   - Redis Pub/Sub para compartir estado entre nodos.
+   - Reconexión automática de WebSockets en el cliente.
 
 ## 📋 Arquitectura
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    CLIENTES (Navegadores)               │
-│                           ↓↓↓                           │
-│                    NGINX (Load Balancer)                │
-│                           ↓↓↓                           │
-│         ┌─────────────────┴─────────────────┐           │
-│         ↓                                     ↓         │
-│    Backend 1                             Backend 2      │
-│         ↓                                     ↓         │
-│    ┌────┴──────────────────────────────┬─────┴────┐     │
-│    ↓                  ↓                 ↓          ↓    │
-│  Redis          MongoDB Primary    MongoDB 2   MongoDB 3│
-│ (Estado)         (Replica Set)                          │
-└─────────────────────────────────────────────────────────┘
+                        ┌─────────────────────┐
+                        │     Cliente Web     │
+                        │  React + TypeScript │
+                        └─────────┬───────────┘
+                                  │
+                                  ▼
+                        ┌─────────────────────┐
+                        │  Nginx Load Balancer│
+                        └─────────┬───────────┘
+                   ┌──────────────┴──────────────┐
+                   ▼                             ▼
+        ┌───────────────────┐            ┌───────────────────┐
+        │   Backend Node.js │            │   Backend Node.js │
+        │   Express + WS    │◀──Redis──▶|   Express + WS    │
+        └─────────┬─────────┘            └─────────┬─────────┘
+                  |────────────────────────────────┘
+                  |
+                  ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+|  ┌─────────────────────┐   ┌─────────────────────┐   ┌─────────────────────┐    |
+|  │   MongoDB (Master)  │───|   MongoDB (Slave)   │───│   MongoDB (Slave)   │    |
+|  └─────────────────────┘   └─────────────────────┘   └─────────────────────┘    |
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+
 ```
 
 ### Componentes:
@@ -156,46 +211,6 @@ docker exec -it aviator-mongo2 mongosh --eval "rs.status()"
 docker start aviator-mongo1
 ```
 
-### Prueba 3: Failover de Redis
-
-⚠️ **Nota**: Redis es un punto único de fallo en esta implementación básica. Para producción, se recomienda Redis Sentinel o Redis Cluster.
-
-Si Redis se cae:
-
-- Las conexiones WebSocket permanecen activas
-- Pero la sincronización entre backends falla
-- Al reiniciar Redis, la sincronización se restaura
-
----
-
-## 🔧 Configuración
-
-### Variables de entorno
-
-Editar `docker-compose.yml`:
-
-```yaml
-environment:
-  - PORT=3000
-  - INSTANCE_NAME=backend1
-  - MONGODB_URI=mongodb://aviator-mongo1:27017,aviator-mongo2:27017,aviator-mongo3:27017/aviator?replicaSet=aviator-rs
-  - REDIS_URL=redis://aviator-redis:6379
-```
-
-### Configuración del juego
-
-Editar `backend/src/config/gameConfig.js`:
-
-```javascript
-module.exports = {
-  minBet: 1, // Apuesta mínima
-  maxBet: 1000, // Apuesta máxima
-  initialBalance: 1000, // Balance inicial
-  tickInterval: 100, // Actualización cada 100ms
-  tickIncrement: 0.01, // Incremento por tick
-};
-```
-
 ---
 
 ## 📊 Monitoreo
@@ -302,7 +317,7 @@ const SERVER_URL = "http://localhost"; // Cambiar si es necesario
 1. **Backend Líder** crea nueva ronda:
 
    - Genera `crashPoint` aleatorio
-   - Calcula `startTime = now + 5000ms` (5 segundos para apostar)
+   - Calcula `startTime = now + 10000ms` (10 segundos para apostar)
    - Calcula `crashTime = startTime + duration`
    - Guarda en Redis: `game:round:current`
    - Publica evento: `game:round:new`
@@ -326,8 +341,8 @@ const SERVER_URL = "http://localhost"; // Cambiar si es necesario
 
 ### Liderazgo
 
-- El líder mantiene un lock en Redis: `game:leader` con TTL de 10s
-- Renueva el lock cada 5s
+- El líder mantiene un lock en Redis: `game:leader` con TTL de 5s
+- Renueva el lock cada 3s
 - Si falla, otro backend toma el liderazgo automáticamente
 
 ---

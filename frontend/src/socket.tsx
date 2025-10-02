@@ -10,7 +10,7 @@ class SocketManager {
       // URL del servidor - cambiar según tu configuración
       // Para mismo PC: "http://localhost" o "http://localhost:80"
       // Para otro PC en LAN: "http://192.168.1.X" (IP del servidor)
-      const SERVER_URL = "http://localhost";
+      const SERVER_URL = "http://192.168.1.3:80";
 
       this.socket = io(SERVER_URL, {
         transports: ["websocket", "polling"],
