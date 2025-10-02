@@ -10,7 +10,7 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  height: 100vh;
+  height: 100dvh;
   gap: 20px;
 }
 
@@ -91,6 +91,7 @@
 
 .multiplier-display {
   height: 60%;
+  max-height: 60%;
   padding: 10px;
   text-align: center;
   background: rgba(0, 0, 0, 0.3);
@@ -142,5 +143,24 @@
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@media screen and (max-width: 450px) {
+  .game-info {
+    display: flex;
+    flex-direction: column;
+  }
+  .middle-content {
+    display: flex;
+    flex-direction: column-reverse;
+    height: auto;
+  }
+  .multiplier-controls {
+    width: 100%;
+  }
+  .multiplier-display {
+    height: 40dvh;
+    max-height: 40dvh;
   }
 }
